@@ -1,0 +1,1023 @@
+diff -ruN a/Makefile b/Makefile
+--- a/Makefile	2020-08-10 18:28:02.000000000 +0000
++++ b/Makefile	2026-11-14 12:12:39.106349108 +0000
+@@ -90,6 +90,12 @@
+ CFLAGS += -fno-pie -nopie
+ endif
+ 
++# Scheduling policy: RR (original xv6), SJF (non-preemptive shortest job
++# first) or HYBRID (SJF-ordered round robin, the default).
++#   make clean && make qemu SCHEDPOLICY=SJF
++SCHEDPOLICY ?= HYBRID
++CFLAGS += -DSCHED_$(SCHEDPOLICY)
++
+ xv6.img: bootblock kernel
+ 	dd if=/dev/zero of=xv6.img count=10000
+ 	dd if=bootblock of=xv6.img conv=notrunc
+@@ -181,6 +187,14 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_getNumProc\
++	_getMaxPid\
++	_getProcInfo\
++	_setBurstTime\
++	_test_1\
++	_test_2\
++	_test_3\
++	_test_scheduler\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -250,7 +264,8 @@
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c\
++	printf.c umalloc.c processInfo.h getNumProc.c getMaxPid.c getProcInfo.c\
++	setBurstTime.c test_1.c test_2.c test_3.c test_scheduler.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+diff -ruN a/defs.h b/defs.h
+--- a/defs.h	2020-08-10 18:28:02.000000000 +0000
++++ b/defs.h	2026-11-14 12:12:13.325808867 +0000
+@@ -8,6 +8,7 @@
+ struct spinlock;
+ struct sleeplock;
+ struct stat;
++struct processInfo;
+ struct superblock;
+ 
+ // bio.c
+@@ -120,6 +121,12 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int             sched_tick(struct proc*);
++int             getNumProc(void);
++int             getMaxPid(void);
++int             getProcInfo(int, struct processInfo*);
++int             set_burst_time(int);
++int             get_burst_time(void);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff -ruN a/getMaxPid.c b/getMaxPid.c
+--- a/getMaxPid.c	1970-01-01 00:00:00.000000000 +0000
++++ b/getMaxPid.c	2026-11-14 12:12:39.113185256 +0000
+@@ -0,0 +1,15 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(void)
++{
++  int mpid = getMaxPid();
++
++  if(mpid < 0)
++    printf(1, "No active processes in process table.\n");
++  else
++    printf(1, "Greatest PID: %d\n", mpid);
++  exit();
++}
+diff -ruN a/getNumProc.c b/getNumProc.c
+--- a/getNumProc.c	1970-01-01 00:00:00.000000000 +0000
++++ b/getNumProc.c	2026-11-14 12:12:39.111572453 +0000
+@@ -0,0 +1,10 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(void)
++{
++  printf(1, "Number of currently active processes: %d\n", getNumProc());
++  exit();
++}
+diff -ruN a/getProcInfo.c b/getProcInfo.c
+--- a/getProcInfo.c	1970-01-01 00:00:00.000000000 +0000
++++ b/getProcInfo.c	2026-11-14 12:12:39.114834999 +0000
+@@ -0,0 +1,28 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "processInfo.h"
++
++// usage: getProcInfo pid [pid ...]
++int
++main(int argc, char *argv[])
++{
++  struct processInfo info;
++  int i, pid;
++
++  if(argc < 2){
++    printf(2, "usage: getProcInfo pid [pid ...]\n");
++    exit();
++  }
++  for(i = 1; i < argc; i++){
++    pid = atoi(argv[i]);
++    if(getProcInfo(pid, &info) < 0){
++      printf(2, "pid %d: no such process\n", pid);
++      continue;
++    }
++    printf(1, "pid %d: name=%s ppid=%d size=%d switches=%d state=%s killed=%d burst=%d\n",
++           pid, info.name, info.ppid, info.psize, info.numberContextSwitches,
++           info.state, info.killed, info.burst_time);
++  }
++  exit();
++}
+diff -ruN a/param.h b/param.h
+--- a/param.h	2020-08-10 18:28:02.000000000 +0000
++++ b/param.h	2026-11-14 14:38:27.170938944 +0000
+@@ -1,6 +1,6 @@
+ #define NPROC        64  // maximum number of processes
+ #define KSTACKSIZE 4096  // size of per-process kernel stack
+-#define NCPU          8  // maximum number of CPUs
++#define NCPU          1  // maximum number of CPUs (1 so scheduling order is observable)
+ #define NOFILE       16  // open files per process
+ #define NFILE       100  // open files per system
+ #define NINODE       50  // maximum number of active i-nodes
+@@ -10,5 +10,5 @@
+ #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+-#define FSSIZE       1000  // size of file system in blocks
++#define FSSIZE       2000  // size of file system in blocks (room for the extra test programs)
+ 
+diff -ruN a/proc.c b/proc.c
+--- a/proc.c	2020-08-10 18:28:02.000000000 +0000
++++ b/proc.c	2026-11-14 12:14:31.306604730 +0000
+@@ -6,6 +6,7 @@
+ #include "x86.h"
+ #include "proc.h"
+ #include "spinlock.h"
++#include "processInfo.h"
+ 
+ struct {
+   struct spinlock lock;
+@@ -14,6 +15,23 @@
+ 
+ static struct proc *initproc;
+ 
++#if !defined(SCHED_RR) && !defined(SCHED_SJF) && !defined(SCHED_HYBRID)
++#define SCHED_HYBRID
++#endif
++
++// Ready queues for SJF / hybrid scheduling. Protected by ptable.lock,
++// like every other piece of scheduling state.
++//   ready : processes eligible in the current round, keyed by burst
++//   next  : (hybrid) processes whose time slice expired this round
++// Invariant: a process is in exactly one heap iff state == RUNNABLE.
++struct {
++  MinHeap ready;
++  MinHeap next;
++  int quantum;        // hybrid: time slice (ticks) for the current round
++} rq;
++
++static void make_runnable(struct proc *p);
++
+ int nextpid = 1;
+ extern void forkret(void);
+ extern void trapret(void);
+@@ -24,6 +42,119 @@
+ pinit(void)
+ {
+   initlock(&ptable.lock, "ptable");
++  rq.quantum = 1;
++}
++
++
++// ---------------------------------------------------------------- min-heap
++// Ordering key. SJF: total expected burst. Hybrid: burst still remaining.
++// Processes that never set a burst (init, sh, test parents) have key 0
++// and are therefore always picked first.
++static int
++key(struct proc *p)
++{
++#ifdef SCHED_HYBRID
++  return p->remaining;
++#else
++  return p->burst_time;
++#endif
++}
++
++static void
++heap_swap(MinHeap *h, int i, int j)
++{
++  struct proc *t = h->arr[i];
++  h->arr[i] = h->arr[j];
++  h->arr[j] = t;
++}
++
++// O(log n)
++static void __attribute__((unused))
++heap_push(MinHeap *h, struct proc *p)
++{
++  int i;
++
++  if(h->size == NPROC)
++    panic("heap_push: full");
++  i = h->size++;
++  h->arr[i] = p;
++  while(i > 0 && key(h->arr[(i-1)/2]) > key(h->arr[i])){
++    heap_swap(h, i, (i-1)/2);
++    i = (i-1)/2;
++  }
++}
++
++// Remove and return the process with the smallest key. O(log n)
++static __attribute__((unused)) struct proc*
++heap_pop(MinHeap *h)
++{
++  struct proc *top;
++  int i, l, r, m;
++
++  if(h->size == 0)
++    return 0;
++  top = h->arr[0];
++  h->arr[0] = h->arr[--h->size];
++  i = 0;
++  for(;;){
++    l = 2*i + 1; r = 2*i + 2; m = i;
++    if(l < h->size && key(h->arr[l]) < key(h->arr[m])) m = l;
++    if(r < h->size && key(h->arr[r]) < key(h->arr[m])) m = r;
++    if(m == i)
++      break;
++    heap_swap(h, i, m);
++    i = m;
++  }
++  return top;
++}
++
++// Mark p RUNNABLE and put it in the current round's ready queue.
++// Every transition to RUNNABLE goes through here (or through yield()).
++// Caller must hold ptable.lock.
++static void
++make_runnable(struct proc *p)
++{
++  p->state = RUNNABLE;
++#ifndef SCHED_RR
++  heap_push(&rq.ready, p);
++#endif
++}
++
++#ifdef SCHED_HYBRID
++// Start a new round: everything that used up its slice becomes eligible
++// again, and the slice is the smallest remaining burst among them
++// (the paper's "burst time of the first process in RQ"). O(n)
++static void
++new_round(void)
++{
++  int i, q = 0;
++
++  rq.ready = rq.next;
++  rq.next.size = 0;
++  for(i = 0; i < rq.ready.size; i++){
++    int k = rq.ready.arr[i]->remaining;
++    if(k > 0 && (q == 0 || k < q))
++      q = k;
++  }
++  rq.quantum = q > 0 ? q : 1;
++}
++#endif
++
++// Called from trap() on every timer tick for the running process.
++// Returns 1 if the process should be preempted.
++int
++sched_tick(struct proc *p)
++{
++  p->time_elapsed++;
++  if(p->remaining > 0)
++    p->remaining--;
++#if defined(SCHED_RR)
++  return 1;                        // round robin: preempt every tick
++#elif defined(SCHED_SJF)
++  return 0;                        // non-preemptive shortest job first
++#else
++  return p->time_elapsed >= rq.quantum;   // hybrid: one slice per round
++#endif
+ }
+ 
+ // Must be called with interrupts disabled
+@@ -88,6 +219,10 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->contextswitches = 0;
++  p->burst_time = 0;
++  p->remaining = 0;
++  p->time_elapsed = 0;
+ 
+   release(&ptable.lock);
+ 
+@@ -148,7 +283,7 @@
+   // because the assignment might not be atomic.
+   acquire(&ptable.lock);
+ 
+-  p->state = RUNNABLE;
++  make_runnable(p);
+ 
+   release(&ptable.lock);
+ }
+@@ -214,7 +349,7 @@
+ 
+   acquire(&ptable.lock);
+ 
+-  np->state = RUNNABLE;
++  make_runnable(np);
+ 
+   release(&ptable.lock);
+ 
+@@ -325,23 +460,35 @@
+   struct proc *p;
+   struct cpu *c = mycpu();
+   c->proc = 0;
+-  
++
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
+ 
+-    // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++#ifdef SCHED_RR
++    // Original xv6 policy: O(NPROC) scan, every RUNNABLE gets a turn.
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
+-
++#else
++    // SJF / hybrid: take the smallest key from the ready heap. O(log n)
++#ifdef SCHED_HYBRID
++    if(rq.ready.size == 0 && rq.next.size > 0)
++      new_round();
++#endif
++    while((p = heap_pop(&rq.ready)) != 0){
++      if(p->state != RUNNABLE)      // defensive: invariant says never
++        continue;
++#endif
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+       c->proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
++      p->time_elapsed = 0;
++      p->contextswitches++;
+ 
+       swtch(&(c->scheduler), p->context);
+       switchkvm();
+@@ -349,9 +496,11 @@
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       c->proc = 0;
++#ifndef SCHED_RR
++      break;    // re-evaluate rounds/heap after every run
++#endif
+     }
+     release(&ptable.lock);
+-
+   }
+ }
+ 
+@@ -385,8 +534,19 @@
+ void
+ yield(void)
+ {
++  struct proc *p = myproc();
++
+   acquire(&ptable.lock);  //DOC: yieldlock
+-  myproc()->state = RUNNABLE;
++#ifdef SCHED_HYBRID
++  if(p->time_elapsed >= rq.quantum){
++    // Slice used up: wait for the next round.
++    p->state = RUNNABLE;
++    heap_push(&rq.next, p);
++  } else
++    make_runnable(p);     // voluntary yield: stay in this round
++#else
++  make_runnable(p);
++#endif
+   sched();
+   release(&ptable.lock);
+ }
+@@ -461,7 +621,7 @@
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+     if(p->state == SLEEPING && p->chan == chan)
+-      p->state = RUNNABLE;
++      make_runnable(p);
+ }
+ 
+ // Wake up all processes sleeping on chan.
+@@ -487,7 +647,7 @@
+       p->killed = 1;
+       // Wake process from sleep if necessary.
+       if(p->state == SLEEPING)
+-        p->state = RUNNABLE;
++        make_runnable(p);
+       release(&ptable.lock);
+       return 0;
+     }
+@@ -532,3 +692,97 @@
+     cprintf("\n");
+   }
+ }
++
++// ---------------------------------------------------------------- Part A
++
++// Number of slots in use (embryo, sleeping, runnable, running, zombie).
++int
++getNumProc(void)
++{
++  struct proc *p;
++  int count = 0;
++
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->state != UNUSED)
++      count++;
++  release(&ptable.lock);
++  return count;
++}
++
++// Largest pid among slots in use, or -1 if none.
++int
++getMaxPid(void)
++{
++  struct proc *p;
++  int max = -1;
++
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->state != UNUSED && p->pid > max)
++      max = p->pid;
++  release(&ptable.lock);
++  return max;
++}
++
++// Fill *st for process pid. Returns 0, or -1 if there is no such process.
++int
++getProcInfo(int pid, struct processInfo *st)
++{
++  static char *states[] = {
++  [UNUSED]    "unused",
++  [EMBRYO]    "embryo",
++  [SLEEPING]  "sleeping",
++  [RUNNABLE]  "runnable",
++  [RUNNING]   "running",
++  [ZOMBIE]    "zombie"
++  };
++  struct proc *p;
++
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state == UNUSED || p->pid != pid)
++      continue;
++    st->ppid = p->parent ? p->parent->pid : 0;
++    st->psize = p->sz;
++    st->numberContextSwitches = p->contextswitches;
++    st->burst_time = p->burst_time;
++    st->killed = p->killed;
++    safestrcpy(st->name, p->name, sizeof(st->name));
++    safestrcpy(st->state, states[p->state], sizeof(st->state));
++    release(&ptable.lock);
++    return 0;
++  }
++  release(&ptable.lock);
++  return -1;
++}
++
++// Set the calling process's expected burst (timer ticks, > 0).
++// Yields once so that a parent forking several children gets to
++// fork them all, and each child gets to set its burst, before the
++// scheduler starts choosing between them.
++int
++set_burst_time(int n)
++{
++  struct proc *p = myproc();
++
++  if(n <= 0)
++    return -1;
++  acquire(&ptable.lock);
++  p->burst_time = n;
++  p->remaining = n;
++  release(&ptable.lock);
++  yield();
++  return 0;
++}
++
++int
++get_burst_time(void)
++{
++  int n;
++
++  acquire(&ptable.lock);
++  n = myproc()->burst_time;
++  release(&ptable.lock);
++  return n;
++}
+diff -ruN a/proc.h b/proc.h
+--- a/proc.h	2020-08-10 18:28:02.000000000 +0000
++++ b/proc.h	2026-11-14 12:11:51.908685672 +0000
+@@ -1,3 +1,10 @@
++// Binary min-heap of runnable processes (ready queue for SJF / hybrid).
++typedef struct MinHeap MinHeap;
++struct MinHeap {
++  struct proc *arr[64];   // NPROC entries
++  int size;
++};
++
+ // Per-CPU state
+ struct cpu {
+   uchar apicid;                // Local APIC ID
+@@ -49,6 +56,10 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int contextswitches;         // times this process was scheduled onto a CPU
++  int burst_time;              // expected CPU burst in timer ticks (0 = not set)
++  int remaining;               // hybrid: burst ticks not yet used
++  int time_elapsed;            // ticks used in the current time slice
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff -ruN a/processInfo.h b/processInfo.h
+--- a/processInfo.h	1970-01-01 00:00:00.000000000 +0000
++++ b/processInfo.h	2026-11-14 12:12:13.328567516 +0000
+@@ -0,0 +1,13 @@
++// Passed from kernel to user by getProcInfo().
++// Starts from the course-provided struct (first three fields) and adds
++// a few fields the test programs print.
++struct processInfo
++{
++    int ppid;                    // parent pid (0 if none)
++    int psize;                   // process size in bytes
++    int numberContextSwitches;   // times scheduled onto a CPU
++    int burst_time;              // set by set_burst_time(), 0 if unset
++    int killed;
++    char name[16];
++    char state[16];
++};
+diff -ruN a/schedtest.h b/schedtest.h
+--- a/schedtest.h	1970-01-01 00:00:00.000000000 +0000
++++ b/schedtest.h	2026-11-14 12:17:58.263065486 +0000
+@@ -0,0 +1,142 @@
++// Shared helpers for the scheduler test programs (test_1/2/3, test_scheduler).
++// Header-only so every test links against the normal ULIB.
++//
++// Burst times are in timer ticks. A CPU-bound child with burst b does b
++// units of CPU work (one unit ~ one tick under qemu), so the burst it
++// declares is an honest estimate. An I/O-bound child alternates a little CPU work
++// with sleep(1), so it blocks and re-enters the ready queue repeatedly.
++
++#include "processInfo.h"
++
++#define CPU 0
++#define IO  1
++#define MAXCHILD 16
++
++struct rec {
++  int pid, burst, type, finish, switches;
++};
++
++static volatile int sink;
++
++static void
++spin(int n)
++{
++  int i;
++  for(i = 0; i < n; i++)
++    sink += i;
++}
++
++// Loop iterations that take about one timer tick (set by calibrate()).
++static int unit = 1000000;
++
++// Measure `unit` by timing a long spin (no polling inside the loop, so
++// the measurement isn't disturbed by system calls). Called once by the
++// parent before forking. Emulated time is noisy: treat turnaround
++// numbers as relative, not absolute.
++static void
++calibrate(void)
++{
++  int n = 1000000, t, dt;
++
++  for(;;){
++    t = uptime();
++    spin(n);
++    dt = uptime() - t;
++    if(dt >= 20 || n >= (1 << 30))
++      break;
++    n *= 2;
++  }
++  unit = n / (dt > 0 ? dt : 1);
++}
++
++static void
++cpu_work(int units)
++{
++  int j;
++  for(j = 0; j < units; j++)
++    spin(unit);
++}
++
++static void
++io_work(int units)
++{
++  int j;
++  for(j = 0; j < units; j++){
++    spin(unit / 4);              // short CPU burst ...
++    sleep(1);                    // ... then block, like waiting for a device
++  }
++}
++
++// Fork n children with the given bursts/types, wait for all of them and
++// print one row per child in completion order, plus averages.
++// Turnaround is measured from the moment the batch starts.
++static void __attribute__((unused))
++run_batch(char *title, int n, int *burst, int *type)
++{
++  int fds[2], i, j, t0, pid, sum = 0, sumcpu = 0, ncpu = 0;
++  struct rec r, done[MAXCHILD];
++  struct processInfo info;
++
++  printf(1, "\n== %s ==\n", title);
++  if(pipe(fds) < 0){
++    printf(2, "pipe failed\n");
++    exit();
++  }
++  t0 = uptime();
++  for(i = 0; i < n; i++){
++    pid = fork();
++    if(pid < 0){
++      printf(2, "fork failed\n");
++      exit();
++    }
++    if(pid == 0){
++      close(fds[0]);
++      set_burst_time(burst[i]);
++      if(type[i] == CPU)
++        cpu_work(burst[i]);
++      else
++        io_work(burst[i]);
++      r.pid = getpid();
++      r.burst = get_burst_time();
++      r.type = type[i];
++      r.finish = uptime() - t0;
++      r.switches = getProcInfo(r.pid, &info) == 0 ? info.numberContextSwitches : -1;
++      write(fds[1], &r, sizeof(r));
++      close(fds[1]);
++      exit();
++    }
++  }
++  close(fds[1]);
++  for(i = 0; i < n; i++)
++    wait();
++  for(i = 0; i < n && read(fds[0], &done[i], sizeof(struct rec)) == sizeof(struct rec); i++)
++    ;
++  close(fds[0]);
++
++  // Sort by finish time (records may reach the pipe slightly out of order).
++  for(j = 1; j < i; j++){
++    struct rec x = done[j];
++    int k = j - 1;
++    while(k >= 0 && done[k].finish > x.finish){
++      done[k+1] = done[k];
++      k--;
++    }
++    done[k+1] = x;
++  }
++
++  printf(1, "order  pid  type  burst  turnaround  switches\n");
++  for(j = 0; j < i; j++){
++    printf(1, "%d      %d   %s   %d     %d          %d\n", j + 1, done[j].pid,
++           done[j].type == CPU ? "CPU" : "IO ", done[j].burst,
++           done[j].finish, done[j].switches);
++    sum += done[j].finish;
++    if(done[j].type == CPU){
++      sumcpu += done[j].finish;
++      ncpu++;
++    }
++  }
++  printf(1, "avg turnaround (all): %d ticks", i ? sum / i : 0);
++  if(ncpu)
++    printf(1, ", CPU-bound only: %d ticks", sumcpu / ncpu);
++  printf(1, ", batch makespan: %d ticks\n", uptime() - t0);
++}
+diff -ruN a/setBurstTime.c b/setBurstTime.c
+--- a/setBurstTime.c	1970-01-01 00:00:00.000000000 +0000
++++ b/setBurstTime.c	2026-11-14 12:12:39.116567550 +0000
+@@ -0,0 +1,24 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++// usage: setBurstTime n
++// Sets this process's burst time and reads it back (tests the
++// set_burst_time / get_burst_time pair).
++int
++main(int argc, char *argv[])
++{
++  int n;
++
++  if(argc < 2){
++    printf(2, "usage: setBurstTime n\n");
++    exit();
++  }
++  n = atoi(argv[1]);
++  if(set_burst_time(n) < 0){
++    printf(2, "set_burst_time(%d) failed (must be > 0)\n", n);
++    exit();
++  }
++  printf(1, "burst time set to %d, get_burst_time() = %d\n", n, get_burst_time());
++  exit();
++}
+diff -ruN a/syscall.c b/syscall.c
+--- a/syscall.c	2020-08-10 18:28:02.000000000 +0000
++++ b/syscall.c	2026-11-14 12:12:13.327006203 +0000
+@@ -103,6 +103,11 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_getNumProc(void);
++extern int sys_getMaxPid(void);
++extern int sys_getProcInfo(void);
++extern int sys_set_burst_time(void);
++extern int sys_get_burst_time(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +131,11 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getNumProc]     sys_getNumProc,
++[SYS_getMaxPid]      sys_getMaxPid,
++[SYS_getProcInfo]    sys_getProcInfo,
++[SYS_set_burst_time] sys_set_burst_time,
++[SYS_get_burst_time] sys_get_burst_time,
+ };
+ 
+ void
+diff -ruN a/syscall.h b/syscall.h
+--- a/syscall.h	2020-08-10 18:28:02.000000000 +0000
++++ b/syscall.h	2026-11-14 12:12:13.326402120 +0000
+@@ -20,3 +20,8 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getNumProc      22
++#define SYS_getMaxPid       23
++#define SYS_getProcInfo     24
++#define SYS_set_burst_time  25
++#define SYS_get_burst_time  26
+diff -ruN a/sysproc.c b/sysproc.c
+--- a/sysproc.c	2020-08-10 18:28:02.000000000 +0000
++++ b/sysproc.c	2026-11-14 12:12:13.327897139 +0000
+@@ -6,6 +6,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "proc.h"
++#include "processInfo.h"
+ 
+ int
+ sys_fork(void)
+@@ -89,3 +90,46 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_getNumProc(void)
++{
++  return getNumProc();
++}
++
++int
++sys_getMaxPid(void)
++{
++  return getMaxPid();
++}
++
++// int getProcInfo(int pid, struct processInfo *info)
++int
++sys_getProcInfo(void)
++{
++  int pid;
++  struct processInfo *st;
++
++  if(argint(0, &pid) < 0)
++    return -1;
++  if(argptr(1, (void*)&st, sizeof(*st)) < 0)
++    return -1;
++  return getProcInfo(pid, st);
++}
++
++// int set_burst_time(int n)
++int
++sys_set_burst_time(void)
++{
++  int n;
++
++  if(argint(0, &n) < 0)
++    return -1;
++  return set_burst_time(n);
++}
++
++int
++sys_get_burst_time(void)
++{
++  return get_burst_time();
++}
+diff -ruN a/test_1.c b/test_1.c
+--- a/test_1.c	1970-01-01 00:00:00.000000000 +0000
++++ b/test_1.c	2026-11-14 12:17:25.754636257 +0000
+@@ -0,0 +1,20 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "schedtest.h"
++
++// 10 children forked with bursts in random order.
++// Even-numbered children are CPU-bound, odd ones I/O-bound.
++int
++main(void)
++{
++  int burst[10] = {40, 70, 10, 90, 60, 30, 20, 80, 100, 50};
++  int type[10];
++  int i;
++
++  calibrate();
++  for(i = 0; i < 10; i++)
++    type[i] = (i % 2 == 0) ? CPU : IO;
++  run_batch("test_1: random order, CPU/IO alternating", 10, burst, type);
++  exit();
++}
+diff -ruN a/test_2.c b/test_2.c
+--- a/test_2.c	1970-01-01 00:00:00.000000000 +0000
++++ b/test_2.c	2026-11-14 12:17:25.754906532 +0000
+@@ -0,0 +1,20 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "schedtest.h"
++
++// 10 children forked with bursts in increasing bursts.
++// Even-numbered children are CPU-bound, odd ones I/O-bound.
++int
++main(void)
++{
++  int burst[10] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
++  int type[10];
++  int i;
++
++  calibrate();
++  for(i = 0; i < 10; i++)
++    type[i] = (i % 2 == 0) ? CPU : IO;
++  run_batch("test_2: increasing bursts, CPU/IO alternating", 10, burst, type);
++  exit();
++}
+diff -ruN a/test_3.c b/test_3.c
+--- a/test_3.c	1970-01-01 00:00:00.000000000 +0000
++++ b/test_3.c	2026-11-14 12:17:25.755150289 +0000
+@@ -0,0 +1,20 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "schedtest.h"
++
++// 10 children forked with bursts in decreasing bursts.
++// Even-numbered children are CPU-bound, odd ones I/O-bound.
++int
++main(void)
++{
++  int burst[10] = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10};
++  int type[10];
++  int i;
++
++  calibrate();
++  for(i = 0; i < 10; i++)
++    type[i] = (i % 2 == 0) ? CPU : IO;
++  run_batch("test_3: decreasing bursts, CPU/IO alternating", 10, burst, type);
++  exit();
++}
+diff -ruN a/test_scheduler.c b/test_scheduler.c
+--- a/test_scheduler.c	1970-01-01 00:00:00.000000000 +0000
++++ b/test_scheduler.c	2026-11-14 12:17:25.755479389 +0000
+@@ -0,0 +1,64 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "schedtest.h"
++
++// Scheduler test suite. Build the kernel with each policy and compare:
++//   make clean && make qemu SCHEDPOLICY=RR      (original xv6)
++//   make clean && make qemu SCHEDPOLICY=SJF
++//   make clean && make qemu SCHEDPOLICY=HYBRID
++// then run `test_scheduler` and compare the tables.
++int
++main(void)
++{
++  int i;
++
++  calibrate();
++  printf(1, "calibration: %d loop iterations per tick\n", unit);
++
++  // Test 1: six CPU-bound children whose declared burst matches the work
++  // they do, forked longest-first. Under SJF they should finish in
++  // increasing burst order and the average turnaround should drop.
++  int b1[6] = {30, 25, 20, 15, 10, 5};
++  int t1[6] = {CPU, CPU, CPU, CPU, CPU, CPU};
++  run_batch("Test 1: CPU-bound, bursts 30..5 forked longest first", 6, b1, t1);
++
++  // Test 2: two identical CPU-bound workloads (20 units each); only the
++  // declared burst differs. The one declaring the shorter burst should
++  // finish first under SJF/hybrid; RR treats them the same.
++  int b2[2] = {40, 5};
++  int t2[2] = {CPU, CPU};
++  printf(1, "\n(test 2: both children do 20 units of work; declared bursts 40 and 5)\n");
++  {
++    int fds[2], pid, t0, k;
++    struct rec r, out[2];
++    pipe(fds);
++    t0 = uptime();
++    for(i = 0; i < 2; i++){
++      if((pid = fork()) == 0){
++        close(fds[0]);
++        set_burst_time(b2[i]);
++        cpu_work(20);
++        r.pid = getpid(); r.burst = get_burst_time(); r.type = t2[i];
++        r.finish = uptime() - t0; r.switches = 0;
++        write(fds[1], &r, sizeof(r));
++        exit();
++      }
++    }
++    close(fds[1]);
++    wait(); wait();
++    for(k = 0; k < 2 && read(fds[0], &out[k], sizeof(r)) == sizeof(r); k++)
++      printf(1, "finished %d: pid %d declared burst %d, turnaround %d ticks\n",
++             k + 1, out[k].pid, out[k].burst, out[k].finish);
++    close(fds[0]);
++  }
++
++  // Test 3: mixed CPU-bound and I/O-bound children. I/O-bound ones block
++  // every tick; the scheduler must still order the CPU-bound ones by
++  // burst and must not lose processes that sleep and wake.
++  int b3[6] = {25, 10, 20, 15, 5, 30};
++  int t3[6] = {CPU, IO, CPU, IO, CPU, IO};
++  run_batch("Test 3: mixed CPU-bound and I/O-bound", 6, b3, t3);
++
++  exit();
++}
+diff -ruN a/trap.c b/trap.c
+--- a/trap.c	2020-08-10 18:28:02.000000000 +0000
++++ b/trap.c	2026-11-14 12:12:13.324694523 +0000
+@@ -102,8 +102,10 @@
+ 
+   // Force process to give up CPU on clock tick.
+   // If interrupts were on while locks held, would need to check nlock.
++  // Whether to preempt on this tick is a scheduling-policy decision
++  // (RR: always, SJF: never, hybrid: when the slice is used up).
+   if(myproc() && myproc()->state == RUNNING &&
+-     tf->trapno == T_IRQ0+IRQ_TIMER)
++     tf->trapno == T_IRQ0+IRQ_TIMER && sched_tick(myproc()))
+     yield();
+ 
+   // Check if the process has been killed since we yielded
+diff -ruN a/user.h b/user.h
+--- a/user.h	2020-08-10 18:28:02.000000000 +0000
++++ b/user.h	2026-11-14 12:12:13.328301179 +0000
+@@ -1,5 +1,6 @@
+ struct stat;
+ struct rtcdate;
++struct processInfo;
+ 
+ // system calls
+ int fork(void);
+@@ -23,6 +24,11 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int getNumProc(void);
++int getMaxPid(void);
++int getProcInfo(int, struct processInfo*);
++int set_burst_time(int);
++int get_burst_time(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff -ruN a/usys.S b/usys.S
+--- a/usys.S	2020-08-10 18:28:02.000000000 +0000
++++ b/usys.S	2026-11-14 12:12:13.328474543 +0000
+@@ -29,3 +29,8 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(getNumProc)
++SYSCALL(getMaxPid)
++SYSCALL(getProcInfo)
++SYSCALL(set_burst_time)
++SYSCALL(get_burst_time)

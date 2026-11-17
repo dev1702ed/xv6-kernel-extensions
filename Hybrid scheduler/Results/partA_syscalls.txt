@@ -1,0 +1,16 @@
+cpu0: starting 0
+sb: size 2000 nblocks 1941 ninodes 200 nlog 30 logstart 2 inodestart 32 bmap start 58
+init: starting sh
+$ getNumProc
+Number of currently active processes: 3
+$ getMaxPid
+Greatest PID: 4
+$ getProcInfo 1 2 99
+pid 1: name=init ppid=0 size=12288 switches=24 state=sleeping killed=0 burst=0
+pid 2: name=sh ppid=1 size=16384 switches=20 state=sleeping killed=0 burst=0
+pid 99: no such process
+$ setBurstTime 7
+burst time set to 7, get_burst_time() = 7
+$ setBurstTime 0
+set_burst_time(0) failed (must be > 0)
+$ 

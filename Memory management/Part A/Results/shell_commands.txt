@@ -1,0 +1,30 @@
+cpu0: starting 0
+sb: size 1000 nblocks 941 ninodes 200 nlog 30 logstart 2 inodestart 32 bmap start 58
+init: starting sh
+$ echo hi
+hi
+$ ls
+.              1 1 512
+..             1 1 512
+README         2 2 2286
+cat            2 3 15280
+echo           2 4 14184
+forktest       2 5 8772
+grep           2 6 18216
+init           2 7 14780
+kill           2 8 14236
+ln             2 9 14136
+ls             2 10 16756
+mkdir          2 11 14264
+rm             2 12 14244
+sh             2 13 28332
+stressfs       2 14 15016
+usertests      2 15 63160
+wc             2 16 15664
+zombie         2 17 13824
+console        3 18 0
+$ cat README | wc
+50 329 2286 
+$ mkdir d; echo lazy > d/f; cat d/f
+lazy
+$ 

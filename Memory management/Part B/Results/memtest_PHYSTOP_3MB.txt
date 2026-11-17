@@ -1,0 +1,85 @@
+cpu0: starting 0
+sb: size 8000 nblocks 7837 ninodes 1024 nlog 30 logstart 2 inodestart 32 bmap start 161
+init: starting sh
+$ memtest
+child 0: all pages matched after re-check
+child 1: all pages matched after re-check
+child 2: all pages matched after re-check
+child 3: all pages matched after re-check
+child 4: all pages matched after re-check
+child 5: all pages matched after re-check
+child 6: all pages matched after re-check
+child 7: all pages matched after re-check
+child 8: all pages matched after re-check
+child 9: all pages matched after re-check
+child 10: all pages matched after re-check
+child 11: all pages matched after re-check
+child 12: all pages matched after re-check
+child 13: all pages matched after re-check
+child 14: all pages matched after re-check
+child 15: all pages matched after re-check
+child 16: all pages matched after re-check
+child 17: all pages matched after re-check
+child 19: all pages matched after re-check
+child 18: all pages matched after re-check
+memtest done
+$ 
+swap: 14 pages out, 0 pages in, 426 pages free
+1 sleep  init 801043f3 80105ab9 80106a95 8010684f
+2 sleep  swapoutd 8010453c 801048e2 80103ec0 80106852
+3 sleep  swapind 8010453c 80104f0a 80103ec0 80106852
+4 run    sh
+$ memtest 20 20
+child 0: all pages matched after re-check
+child 1: all pages matched after re-check
+child 2: all pages matched after re-check
+child 3: all pages matched after re-check
+child 4: all pages matched after re-check
+child 5: all pages matched after re-check
+child 7: all pages matched after re-check
+child 11: all pages matched after re-check
+child 12: all pages matched after re-check
+child 13: all pages matched after re-check
+child 6: all pages matched after re-check
+child 8: all pages matched after re-check
+child 9: all pages matched after re-check
+child 19: all pages matched after re-check
+child 15: all pages matched after re-check
+child 16: all pages matched after re-check
+child 17: all pages matched after re-check
+child 18: all pages matched after re-check
+child 14: all pages matched after re-check
+child 10: all pages matched after re-check
+memtest done
+$ 
+swap: 36 pages out, 19 pages in, 428 pages free
+1 sleep  init 801043f3 80105ab9 80106a95 8010684f
+2 sleep  swapoutd 8010453c 801048e2 80103ec0 80106852
+3 sleep  swapind 8010453c 80104f0a 80103ec0 80106852
+4 run    sh
+$ ls
+.              1 1 544
+..             1 1 544
+README         2 2 2286
+cat            2 3 18720
+echo           2 4 17620
+forktest       2 5 8772
+grep           2 6 21656
+init           2 7 18172
+kill           2 8 17672
+ln             2 9 17580
+ls             2 10 20200
+mkdir          2 11 17704
+rm             2 12 17688
+sh             2 13 31728
+stressfs       2 14 18452
+usertests      2 15 66544
+wc             2 16 19104
+zombie         2 17 17264
+memtest        2 18 22888
+console        3 19 0
+1_1.swp        2 20 4096
+4_2.swp        2 21 4096
+1_0.swp        2 22 4096
+1_3.swp        2 23 4096
+$ 

@@ -1,0 +1,1280 @@
+diff -ruN a/Makefile b/Makefile
+--- a/Makefile	2020-08-10 18:28:02.000000000 +0000
++++ b/Makefile	2026-11-14 12:23:11.588180308 +0000
+@@ -90,6 +90,12 @@
+ CFLAGS += -fno-pie -nopie
+ endif
+ 
++# Lower physical memory to force swapping, e.g.
++#   make clean && make qemu-nox PHYSTOP=0x300000
++ifdef PHYSTOP
++CFLAGS += -DPHYSTOP=$(PHYSTOP)
++endif
++
+ xv6.img: bootblock kernel
+ 	dd if=/dev/zero of=xv6.img count=10000
+ 	dd if=bootblock of=xv6.img conv=notrunc
+@@ -143,7 +149,7 @@
+ vectors.S: vectors.pl
+ 	./vectors.pl > vectors.S
+ 
+-ULIB = ulib.o usys.o printf.o umalloc.o
++ULIB = ulib.o usys.o printf.o umalloc.o random.o
+ 
+ _%: %.o $(ULIB)
+ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+@@ -181,6 +187,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_memtest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -250,7 +257,7 @@
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c\
++	printf.c umalloc.c memtest.c random.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+diff -ruN a/defs.h b/defs.h
+--- a/defs.h	2020-08-10 18:28:02.000000000 +0000
++++ b/defs.h	2026-11-14 13:41:51.893689562 +0000
+@@ -9,6 +9,7 @@
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct sleeplock;
+ 
+ // bio.c
+ void            binit(void);
+@@ -65,6 +66,7 @@
+ 
+ // kalloc.c
+ char*           kalloc(void);
++int             kfreecount(void);
+ void            kfree(char*);
+ void            kinit1(void*, void*);
+ void            kinit2(void*, void*);
+@@ -120,6 +122,16 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++void            create_kernel_process(const char*, void (*)(void));
++void            swap_out_process_function(void);
++void            swap_in_process_function(void);
++int             swap_in_request(uint);
++int             swap_read_page(int, uint, char*);
++void            swap_free_range(int, pde_t*, uint, uint);
++int             kreserve(int);
++// pages setupkvm() needs: page directory + tables for the kernel map and devices
++#define KPGTABLES (1 + PHYSTOP/(4*1024*1024) + 1 + 8)
++extern struct sleeplock swapio;
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+@@ -184,6 +196,9 @@
+ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
++char*           kalloc_user(void);
++uint*           walkpgdir(pde_t*, const void*, int);   // returns pte_t*
++int             mappages(pde_t*, void*, uint, uint, int);
+ void            clearpteu(pde_t *pgdir, char *uva);
+ 
+ // number of elements in fixed-size array
+diff -ruN a/exec.c b/exec.c
+--- a/exec.c	2020-08-10 18:28:02.000000000 +0000
++++ b/exec.c	2026-11-14 13:41:51.893183867 +0000
+@@ -35,8 +35,9 @@
+   if(elf.magic != ELF_MAGIC)
+     goto bad;
+ 
+-  if((pgdir = setupkvm()) == 0)
+-    goto bad;
++  while((pgdir = setupkvm()) == 0)
++    if(kreserve(KPGTABLES) < 0)     // make room, possibly by swapping
++      goto bad;
+ 
+   // Load program into memory.
+   sz = 0;
+@@ -95,6 +96,7 @@
+ 
+   // Commit to the user image.
+   oldpgdir = curproc->pgdir;
++  swap_free_range(curproc->pid, oldpgdir, 0, curproc->sz);
+   curproc->pgdir = pgdir;
+   curproc->sz = sz;
+   curproc->tf->eip = elf.entry;  // main
+diff -ruN a/kalloc.c b/kalloc.c
+--- a/kalloc.c	2020-08-10 18:28:02.000000000 +0000
++++ b/kalloc.c	2026-11-14 12:20:51.869286278 +0000
+@@ -21,6 +21,7 @@
+   struct spinlock lock;
+   int use_lock;
+   struct run *freelist;
++  int nfree;            // number of pages on freelist
+ } kmem;
+ 
+ // Initialization happens in two phases.
+@@ -72,6 +73,7 @@
+   r = (struct run*)v;
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  kmem.nfree++;
+   if(kmem.use_lock)
+     release(&kmem.lock);
+ }
+@@ -87,10 +89,25 @@
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r){
+     kmem.freelist = r->next;
++    kmem.nfree--;
++  }
+   if(kmem.use_lock)
+     release(&kmem.lock);
+   return (char*)r;
+ }
+ 
++// Number of free physical pages (a snapshot; may change immediately).
++int
++kfreecount(void)
++{
++  int n;
++
++  if(kmem.use_lock)
++    acquire(&kmem.lock);
++  n = kmem.nfree;
++  if(kmem.use_lock)
++    release(&kmem.lock);
++  return n;
++}
+diff -ruN a/main.c b/main.c
+--- a/main.c	2020-08-10 18:28:02.000000000 +0000
++++ b/main.c	2026-11-14 12:23:11.580570327 +0000
+@@ -17,7 +17,8 @@
+ int
+ main(void)
+ {
+-  kinit1(end, P2V(4*1024*1024)); // phys page allocator
++  // phys page allocator (PHYSTOP may be below 4MB in low-memory test builds)
++  kinit1(end, P2V(PHYSTOP < 4*1024*1024 ? PHYSTOP : 4*1024*1024));
+   kvmalloc();      // kernel page table
+   mpinit();        // detect other processors
+   lapicinit();     // interrupt controller
+@@ -34,6 +35,8 @@
+   startothers();   // start other processors
+   kinit2(P2V(4*1024*1024), P2V(PHYSTOP)); // must come after startothers()
+   userinit();      // first user process
++  create_kernel_process("swapoutd", swap_out_process_function);
++  create_kernel_process("swapind", swap_in_process_function);
+   mpmain();        // finish this processor's setup
+ }
+ 
+diff -ruN a/memlayout.h b/memlayout.h
+--- a/memlayout.h	2020-08-10 18:28:02.000000000 +0000
++++ b/memlayout.h	2026-11-14 12:23:11.588768449 +0000
+@@ -1,7 +1,11 @@
+ // Memory layout
+ 
+ #define EXTMEM  0x100000            // Start of extended memory
+-#define PHYSTOP 0xE000000           // Top physical memory
++// Top physical memory. Override at build time to create memory pressure
++// for the swapping test, e.g.  make qemu PHYSTOP=0x300000
++#ifndef PHYSTOP
++#define PHYSTOP 0xE000000
++#endif
+ #define DEVSPACE 0xFE000000         // Other devices are at high addresses
+ 
+ // Key addresses for address space layout (see kmap in vm.c for layout)
+diff -ruN a/memtest.c b/memtest.c
+--- a/memtest.c	1970-01-01 00:00:00.000000000 +0000
++++ b/memtest.c	2026-11-14 12:23:11.589097654 +0000
+@@ -0,0 +1,112 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++// Sanity test for swapping to disk.
++//
++//   memtest [children] [iterations]      default 20 children x 10 iterations
++//
++// Each child allocates 4 KB per iteration with malloc, fills it with
++// values from a deterministic function of (child, iteration, offset) and
++// checks it straight away (as the handout asks). It keeps every buffer,
++// and at the end re-checks ALL of them in random order: by then other
++// children have competed for memory, so pages that were swapped out and
++// back in are verified too. Build with a small PHYSTOP to force paging:
++//   make clean && make qemu-nox PHYSTOP=0x300000
++
++#define PGSIZE 4096
++#define MAXITER 64
++
++static char
++value(int child, int iter, int k)
++{
++  return (char)((child * 31 + iter * 7 + k * 13 + (k >> 5)) % 251);
++}
++
++// xv6's printf writes one character at a time, so lines from different
++// children interleave. Build each line first and write it in one call.
++static void
++say(char *a, int n, char *b)
++{
++  char buf[96], tmp[12];
++  int i = 0, j = 0;
++
++  while(*a) buf[i++] = *a++;
++  do { tmp[j++] = '0' + n % 10; n /= 10; } while(n > 0);
++  while(j > 0) buf[i++] = tmp[--j];
++  while(*b) buf[i++] = *b++;
++  write(1, buf, i);
++}
++
++static int
++check(char *buf, int child, int iter)
++{
++  int k, bad = 0;
++
++  for(k = 0; k < PGSIZE; k++)
++    if(buf[k] != value(child, iter, k))
++      bad++;
++  return bad;
++}
++
++static void
++child_process(int child, int iters)
++{
++  char *ptr[MAXITER];
++  int j, k, bad, total = 0;
++
++  for(j = 0; j < iters; j++){
++    if((ptr[j] = malloc(PGSIZE)) == 0){
++      printf(1, "child %d: malloc failed at iteration %d\n", child, j);
++      exit();
++    }
++    for(k = 0; k < PGSIZE; k++)
++      ptr[j][k] = value(child, j, k);
++    bad = check(ptr[j], child, j);
++    if(bad)
++      say("bad bytes right after writing, child ", child, "\n");
++    total += bad;
++  }
++
++  // Let the other children allocate (and push our pages out) first.
++  sleep(20);
++
++  // Re-verify every page, in random order.
++  for(k = 0; k < iters * 2; k++){
++    j = randomrange(0, iters - 1);
++    total += check(ptr[j], child, j);
++  }
++  for(j = 0; j < iters; j++)
++    total += check(ptr[j], child, j);
++
++  say("child ", child, total == 0 ? ": all pages matched after re-check\n"
++                                   : ": MISMATCH after re-check\n");
++  exit();
++}
++
++int
++main(int argc, char *argv[])
++{
++  int i, n = 20, iters = 10;
++
++  if(argc > 1)
++    n = atoi(argv[1]);
++  if(argc > 2)
++    iters = atoi(argv[2]);
++  if(iters > MAXITER)
++    iters = MAXITER;
++
++  for(i = 0; i < n; i++){
++    int pid = fork();
++    if(pid < 0){
++      printf(1, "fork failed at child %d\n", i);
++      break;
++    }
++    if(pid == 0)
++      child_process(i, iters);
++  }
++  while(wait() != -1)
++    ;
++  printf(1, "memtest done\n");
++  exit();
++}
+diff -ruN a/mkfs.c b/mkfs.c
+--- a/mkfs.c	2020-08-10 18:28:02.000000000 +0000
++++ b/mkfs.c	2026-11-14 12:20:33.762582561 +0000
+@@ -15,7 +15,7 @@
+ #define static_assert(a, b) do { switch (0) case 0: case (a): ; } while (0)
+ #endif
+ 
+-#define NINODES 200
++#define NINODES 1024   // one inode per swapped-out page
+ 
+ // Disk layout:
+ // [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
+diff -ruN a/mmu.h b/mmu.h
+--- a/mmu.h	2020-08-10 18:28:02.000000000 +0000
++++ b/mmu.h	2026-11-14 12:20:33.761675730 +0000
+@@ -94,6 +94,9 @@
+ #define PTE_P           0x001   // Present
+ #define PTE_W           0x002   // Writeable
+ #define PTE_U           0x004   // User
++#define PTE_A           0x020   // Accessed (set by hardware on any access)
++#define PTE_D           0x040   // Dirty (set by hardware on write)
++#define PTE_SWAP        0x200   // Software bit: page is swapped out to disk (P clear)
+ #define PTE_PS          0x080   // Page Size
+ 
+ // Address in page table or page directory entry
+diff -ruN a/param.h b/param.h
+--- a/param.h	2020-08-10 18:28:02.000000000 +0000
++++ b/param.h	2026-11-14 12:20:33.762417129 +0000
+@@ -1,6 +1,6 @@
+ #define NPROC        64  // maximum number of processes
+ #define KSTACKSIZE 4096  // size of per-process kernel stack
+-#define NCPU          8  // maximum number of CPUs
++#define NCPU          1  // maximum number of CPUs (swapper assumes one CPU, see proc.c)
+ #define NOFILE       16  // open files per process
+ #define NFILE       100  // open files per system
+ #define NINODE       50  // maximum number of active i-nodes
+@@ -10,5 +10,5 @@
+ #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+-#define FSSIZE       1000  // size of file system in blocks
++#define FSSIZE       8000  // size of file system in blocks (room for swap files)
+ 
+diff -ruN a/proc.c b/proc.c
+--- a/proc.c	2020-08-10 18:28:02.000000000 +0000
++++ b/proc.c	2026-11-14 13:42:25.392933945 +0000
+@@ -6,6 +6,10 @@
+ #include "x86.h"
+ #include "proc.h"
+ #include "spinlock.h"
++#include "sleeplock.h"
++#include "stat.h"
++#include "fs.h"
++#include "file.h"
+ 
+ struct {
+   struct spinlock lock;
+@@ -13,6 +17,506 @@
+ } ptable;
+ 
+ static struct proc *initproc;
++static struct proc *allocproc(void);
++
++// ---------------------------------------------------------------- swapping
++//
++// Two kernel processes move user pages between memory and swap files:
++//   swapoutd  frees a physical page when an allocation fails (queue1)
++//   swapind   reads a swapped-out page back on a page fault (queue2)
++//
++// Locking rules
++//   queue1.lock / queue2.lock  protect the request queues; waiters sleep
++//                              on them, so a wakeup can't be lost.
++//   swapio (sleeplock)         serialises all swap-file I/O and every
++//                              PTE_P <-> PTE_SWAP transition on user pages.
++//   ptable.lock                held while choosing a victim, so processes
++//                              can't exit and free their page tables
++//                              under us.
++// No spinlock is ever held across file I/O (which sleeps).
++//
++// One CPU (NCPU = 1) is assumed: a victim process is never running while
++// its PTE is changed, and switchuvm() reloads CR3 (flushing its TLB)
++// before it runs again.
++//
++// A swapped-out PTE has P clear and PTE_SWAP set; its W/U bits are kept.
++// The page is stored in "/<pid>_<vpn>.swp" (vpn = VA >> 12, in hex),
++// i.e. the 20 most significant bits of the VA, as the handout asks.
++// The name is at most 13 characters (DIRSIZ is 14).
++
++struct req_queue {
++  struct spinlock lock;
++  struct proc *queue[NPROC];
++  int s, e;                  // circular: pop at s, push at e
++};
++
++struct req_queue queue1;     // processes waiting for a free page
++struct req_queue queue2;     // processes waiting for a page to be swapped in
++struct sleeplock swapio;
++static struct proc *swapoutd;
++static int nswapout, nswapin;   // statistics, shown by ^P (procdump)
++static int nswapped;            // pages currently on disk (guarded by swapio)
++
++// Swap space is the root file system (FSSIZE blocks, NINODES inodes in
++// mkfs.c). Each swapped page needs 8 blocks and an inode; stop well short
++// of either limit. When swap is full, allocations fail as in vanilla xv6.
++#define MAXSWAP 700
++
++// Caller holds q->lock. Returns 0 if the queue is full.
++static int
++rpush(struct req_queue *q, struct proc *p)
++{
++  if((q->e + 1) % NPROC == q->s)
++    return 0;
++  q->queue[q->e] = p;
++  q->e = (q->e + 1) % NPROC;
++  return 1;
++}
++
++// Caller holds q->lock. Returns 0 if the queue is empty.
++static struct proc*
++rpop(struct req_queue *q)
++{
++  struct proc *p;
++
++  if(q->s == q->e)
++    return 0;
++  p = q->queue[q->s];
++  q->s = (q->s + 1) % NPROC;
++  return p;
++}
++
++// ------------------------------------------------ swap files (inode level)
++
++static void
++swap_name(char *buf, int pid, uint va)
++{
++  static char hex[] = "0123456789abcdef";
++  char tmp[16];
++  uint vpn = va >> PTXSHIFT;
++  int i = 0, n = 0;
++
++  buf[n++] = '/';
++  do { tmp[i++] = '0' + pid % 10; pid /= 10; } while(pid > 0);
++  while(i > 0) buf[n++] = tmp[--i];
++  buf[n++] = '_';
++  do { tmp[i++] = hex[vpn % 16]; vpn /= 16; } while(vpn > 0);
++  while(i > 0) buf[n++] = tmp[--i];
++  safestrcpy(buf + n, ".swp", 5);
++}
++
++// Create (or truncate-in-place) a regular file. Like create() in sysfile.c.
++// Returns a locked inode. Caller is inside begin_op()/end_op().
++static struct inode*
++swap_create(char *path)
++{
++  struct inode *ip, *dp;
++  char name[DIRSIZ];
++
++  if((dp = nameiparent(path, name)) == 0)
++    return 0;
++  ilock(dp);
++  if((ip = dirlookup(dp, name, 0)) != 0){
++    iunlockput(dp);
++    ilock(ip);
++    return ip;
++  }
++  if((ip = ialloc(dp->dev, T_FILE)) == 0)
++    panic("swap_create: ialloc");
++  ilock(ip);
++  ip->major = 0;
++  ip->minor = 0;
++  ip->nlink = 1;
++  iupdate(ip);
++  if(dirlink(dp, name, ip->inum) < 0)
++    panic("swap_create: dirlink");
++  iunlockput(dp);
++  return ip;
++}
++
++// Write one page to the swap file of (pid, va). Caller holds swapio.
++static int
++swap_write_page(int pid, uint va, char *page)
++{
++  char path[32];
++  struct inode *ip;
++  int off, n, max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;   // as in filewrite()
++
++  swap_name(path, pid, va);
++  begin_op();
++  ip = swap_create(path);
++  if(ip == 0){
++    end_op();
++    return -1;
++  }
++  iunlock(ip);
++  end_op();
++
++  // Write in pieces small enough for one log transaction each.
++  for(off = 0; off < PGSIZE; off += n){
++    n = PGSIZE - off < max ? PGSIZE - off : max;
++    begin_op();
++    ilock(ip);
++    if(writei(ip, page + off, off, n) != n){
++      iunlock(ip);
++      end_op();
++      iput(ip);
++      return -1;
++    }
++    iunlock(ip);
++    end_op();
++  }
++  begin_op();
++  iput(ip);
++  end_op();
++  return 0;
++}
++
++// Read the swap file of (pid, va) into page. Caller holds swapio.
++int
++swap_read_page(int pid, uint va, char *page)
++{
++  char path[32];
++  struct inode *ip;
++  int r;
++
++  swap_name(path, pid, va);
++  begin_op();
++  if((ip = namei(path)) == 0){
++    end_op();
++    return -1;
++  }
++  ilock(ip);
++  r = readi(ip, page, 0, PGSIZE);
++  iunlockput(ip);
++  end_op();
++  return r == PGSIZE ? 0 : -1;
++}
++
++// Remove the swap file of (pid, va). Like sys_unlink(). Caller holds swapio.
++static void
++swap_unlink(int pid, uint va)
++{
++  char path[32], name[DIRSIZ];
++  struct inode *ip, *dp;
++  struct dirent de;
++  uint off;
++
++  swap_name(path, pid, va);
++  begin_op();
++  if((dp = nameiparent(path, name)) == 0){
++    end_op();
++    return;
++  }
++  ilock(dp);
++  if((ip = dirlookup(dp, name, &off)) == 0){
++    iunlockput(dp);
++    end_op();
++    return;
++  }
++  ilock(ip);
++  memset(&de, 0, sizeof(de));
++  if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
++    panic("swap_unlink: writei");
++  iunlockput(dp);
++  ip->nlink--;
++  iupdate(ip);
++  iunlockput(ip);
++  end_op();
++}
++
++// Delete the swap files for every swapped-out page of pgdir in
++// [start, end), and clear those PTEs. Used by exit, exec and sbrk(-n).
++void
++swap_free_range(int pid, pde_t *pgdir, uint start, uint end)
++{
++  uint va;
++  pte_t *pte;
++
++  acquiresleep(&swapio);
++  for(va = PGROUNDUP(start); va < end; va += PGSIZE){
++    if((pte = walkpgdir(pgdir, (char*)va, 0)) != 0 && (*pte & PTE_SWAP)){
++      swap_unlink(pid, va);
++      *pte = 0;
++      nswapped--;
++    }
++  }
++  releasesleep(&swapio);
++}
++
++// ------------------------------------------------ swapping out
++
++// Suspend the calling process (SLEEPING) and queue a request for the
++// swap-out daemon; return when it has freed a page. Returns -1 if it
++// could not free anything (or we were killed).
++static int
++wait_for_page(struct proc *p)
++{
++  int failed;
++
++  if(p == 0 || p == swapoutd)        // boot code / the swapper itself
++    return -1;
++  acquire(&queue1.lock);
++  if(!rpush(&queue1, p)){
++    release(&queue1.lock);
++    return -1;
++  }
++  wakeup(&queue1);                   // swapoutd sleeps on &queue1
++  sleep(p, &queue1.lock);
++  failed = p->swapfail;
++  p->swapfail = 0;
++  release(&queue1.lock);
++  return (failed || p->killed) ? -1 : 0;
++}
++
++// Allocate a page for user memory, swapping something out if memory is
++// exhausted. Returns 0 only if nothing could be swapped out.
++char*
++kalloc_user(void)
++{
++  char *mem;
++
++  for(;;){
++    if((mem = kalloc()) != 0)
++      return mem;
++    if(wait_for_page(myproc()) < 0)
++      return 0;
++  }
++}
++
++// Wait until at least n physical pages are free, swapping pages out if
++// necessary. Used before allocations that can't simply call kalloc_user():
++// page tables (setupkvm, mappages) and kernel stacks. Pages aren't held
++// while waiting, so waiters can't starve each other; since the kernel is
++// preemptible, callers retry if someone else took the pages first.
++int
++kreserve(int n)
++{
++  while(kfreecount() < n)
++    if(wait_for_page(myproc()) < 0)
++      return -1;
++  return 0;
++}
++
++static int clock_proc, clock_va;     // second-chance clock hand
++
++// Is p's memory a candidate for eviction? Caller holds ptable.lock.
++static int
++evictable(struct proc *p)
++{
++  return !p->kproc && p->pgdir != 0 &&
++         (p->state == RUNNABLE || p->state == SLEEPING);
++}
++
++// Choose a victim with the second-chance (clock) approximation of LRU:
++// sweep user pages of all processes; a page whose Accessed bit is set
++// gets the bit cleared and is skipped this time; the first page found
++// with A clear is the victim. At most two full sweeps.
++// Caller holds swapio and ptable.lock. Marks the PTE swapped and returns
++// the physical frame (still allocated), or 0 if there is nothing to evict.
++static uint
++choose_victim(int *pidp, uint *vap, pte_t **ptep)
++{
++  int sweeps, scanned, nproc = NPROC;
++  struct proc *p;
++  pte_t *pte;
++  uint pa;
++
++  for(sweeps = 0; sweeps < 2; sweeps++){
++    for(scanned = 0; scanned <= nproc; scanned++){
++      p = &ptable.proc[clock_proc];
++      if(evictable(p)){
++        for(; clock_va < p->sz; clock_va += PGSIZE){
++          pte = walkpgdir(p->pgdir, (char*)clock_va, 0);
++          if(pte == 0 || !(*pte & PTE_P) || !(*pte & PTE_U))
++            continue;
++          if(*pte & PTE_A){
++            *pte &= ~PTE_A;          // second chance
++            continue;
++          }
++          pa = PTE_ADDR(*pte);
++          *pidp = p->pid;
++          *vap = clock_va;
++          *ptep = pte;
++          *pte = (*pte & ~(PTE_P | PTE_A | PTE_D)) | PTE_SWAP;
++          clock_va += PGSIZE;
++          return pa;
++        }
++      }
++      clock_proc = (clock_proc + 1) % NPROC;
++      clock_va = 0;
++    }
++  }
++  return 0;
++}
++
++// Evict one page. Returns 1 if a page was freed.
++static int
++swap_out_one(void)
++{
++  int pid;
++  uint va, pa;
++  pte_t *pte;
++
++  acquiresleep(&swapio);
++  if(nswapped >= MAXSWAP){           // swap space full
++    releasesleep(&swapio);
++    return 0;
++  }
++  acquire(&ptable.lock);
++  pa = choose_victim(&pid, &va, &pte);
++  release(&ptable.lock);
++  if(pa == 0){
++    releasesleep(&swapio);
++    return 0;
++  }
++  // The PTE already says "swapped", so a fault on it will queue a
++  // swap-in, which can't proceed until we release swapio below.
++  if(swap_write_page(pid, va, (char*)P2V(pa)) < 0){
++    // Disk full: undo. The victim can't have exited meanwhile (exit
++    // needs swapio to clean up), so its PTE is still valid.
++    swap_unlink(pid, va);
++    *pte = pa | (PTE_FLAGS(*pte) & ~PTE_SWAP) | PTE_P;
++    releasesleep(&swapio);
++    return 0;
++  }
++  nswapout++;
++  nswapped++;
++  releasesleep(&swapio);
++  kfree((char*)P2V(pa));
++  return 1;
++}
++
++// Entry point of the swap-out kernel process.
++void
++swap_out_process_function(void)
++{
++  struct proc *p;
++  int freed;
++
++  for(;;){
++    acquire(&queue1.lock);
++    while(queue1.s == queue1.e)
++      sleep(&queue1, &queue1.lock);   // no requests: suspended
++    release(&queue1.lock);
++
++    // Evict one page per request round, even if a few pages are already
++    // free: a waiter may need several (kreserve), and "some page is free"
++    // alone could leave it waiting forever. Only report failure if
++    // nothing could be evicted and nothing is free.
++    freed = swap_out_one() || kfreecount() > 0;
++
++    // A page is free: wake every process that was waiting for memory
++    // (they retry kalloc). If nothing could be evicted, tell them to fail.
++    acquire(&queue1.lock);
++    while((p = rpop(&queue1)) != 0){
++      if(!freed)
++        p->swapfail = 1;
++      wakeup(p);
++    }
++    release(&queue1.lock);
++  }
++}
++
++// ------------------------------------------------ swapping in
++
++// Called by trap() on a page fault at addr. If the page was swapped
++// out, queue a swap-in request, sleep until the page is mapped again and
++// return 0. Returns -1 for any other fault.
++int
++swap_in_request(uint addr)
++{
++  struct proc *p = myproc();
++  pte_t *pte;
++
++  if(p == 0 || p->kproc || addr >= KERNBASE)
++    return -1;
++  if((pte = walkpgdir(p->pgdir, (char*)addr, 0)) == 0 || !(*pte & PTE_SWAP))
++    return -1;
++  if(mycpu()->ncli > 0)
++    panic("page fault on a swapped page while holding a spinlock");
++
++  acquire(&queue2.lock);
++  p->addr = PGROUNDDOWN(addr);
++  if(!rpush(&queue2, p))
++    panic("swap-in queue full");
++  wakeup(&queue2);                   // swapind sleeps on &queue2
++  while(!(*pte & PTE_P))
++    sleep(p, &queue2.lock);
++  release(&queue2.lock);
++  return 0;
++}
++
++// Entry point of the swap-in kernel process.
++void
++swap_in_process_function(void)
++{
++  struct proc *p;
++  pte_t *pte;
++  char *mem;
++  uint va;
++  int pid;
++
++  for(;;){
++    acquire(&queue2.lock);
++    while((p = rpop(&queue2)) == 0)
++      sleep(&queue2, &queue2.lock);   // no requests: suspended
++    pid = p->pid;
++    va = p->addr;
++    release(&queue2.lock);
++
++    // Get a frame before taking swapio: if memory is short this waits
++    // for swapoutd, which itself needs swapio.
++    while((mem = kalloc_user()) == 0)
++      ;
++
++    // p cannot exit while it waits for this page (it loops in
++    // swap_in_request until the page is present), so p->pgdir is stable.
++    acquiresleep(&swapio);
++    pte = walkpgdir(p->pgdir, (char*)va, 0);
++    if(p->pid != pid || pte == 0 || !(*pte & PTE_SWAP))
++      panic("swap_in: bad request");
++    if(swap_read_page(pid, va, mem) < 0)
++      panic("swap_in: read");
++    swap_unlink(pid, va);
++    *pte = V2P(mem) | (PTE_FLAGS(*pte) & ~PTE_SWAP) | PTE_P;
++    nswapin++;
++    nswapped--;
++    releasesleep(&swapio);
++
++    acquire(&queue2.lock);
++    wakeup(p);
++    release(&queue2.lock);
++  }
++}
++
++// ------------------------------------------------ kernel processes
++
++// Create a process that lives entirely in kernel mode, starting at
++// entrypoint. It gets a kernel-only page table and the root directory as
++// cwd (it opens swap files), and is made RUNNABLE.
++void
++create_kernel_process(const char *name, void (*entrypoint)(void))
++{
++  struct proc *p;
++
++  if((p = allocproc()) == 0)
++    panic("create_kernel_process: allocproc");
++  if((p->pgdir = setupkvm()) == 0)
++    panic("create_kernel_process: setupkvm");
++  p->sz = 0;
++  p->kproc = 1;
++  p->kentry = entrypoint;
++  p->parent = initproc;
++  p->cwd = namei("/");
++  safestrcpy(p->name, name, sizeof(p->name));
++  if(entrypoint == swap_out_process_function)
++    swapoutd = p;
++
++  acquire(&ptable.lock);
++  p->state = RUNNABLE;
++  release(&ptable.lock);
++}
+ 
+ int nextpid = 1;
+ extern void forkret(void);
+@@ -24,6 +528,9 @@
+ pinit(void)
+ {
+   initlock(&ptable.lock, "ptable");
++  initlock(&queue1.lock, "swapout queue");
++  initlock(&queue2.lock, "swapin queue");
++  initsleeplock(&swapio, "swapio");
+ }
+ 
+ // Must be called with interrupts disabled
+@@ -88,6 +595,10 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->kproc = 0;
++  p->kentry = 0;
++  p->addr = 0;
++  p->swapfail = 0;
+ 
+   release(&ptable.lock);
+ 
+@@ -162,6 +673,8 @@
+   struct proc *curproc = myproc();
+ 
+   sz = curproc->sz;
++  if(n < 0)
++    swap_free_range(curproc->pid, curproc->pgdir, sz + n, sz);
+   if(n > 0){
+     if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
+       return -1;
+@@ -184,10 +697,11 @@
+   struct proc *np;
+   struct proc *curproc = myproc();
+ 
+-  // Allocate process.
+-  if((np = allocproc()) == 0){
+-    return -1;
+-  }
++  // Allocate process. If that failed for lack of memory (not of
++  // process slots), make room - possibly by swapping - and retry.
++  while((np = allocproc()) == 0)
++    if(kfreecount() > 0 || kreserve(1) < 0)
++      return -1;
+ 
+   // Copy process state from proc.
+   if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+@@ -229,6 +743,7 @@
+ {
+   struct proc *curproc = myproc();
+   struct proc *p;
++  pde_t *pgdir;
+   int fd;
+ 
+   if(curproc == initproc)
+@@ -247,6 +762,24 @@
+   end_op();
+   curproc->cwd = 0;
+ 
++  // Remove this process's swap files. Nothing below sleeps, so the
++  // swapper cannot evict another of our pages before we become a ZOMBIE
++  // (zombies are never chosen as victims).
++  swap_free_range(curproc->pid, curproc->pgdir, 0, curproc->sz);
++
++  // Free the whole address space now rather than in the parent's wait():
++  // under memory pressure a parent may not reap for a long time (memtest
++  // forks all its children before waiting), and a zombie's memory can't
++  // be swapped out. Switch to the kernel-only page table first so we are
++  // not running on the one being freed, and keep interrupts off until
++  // sched() so we can't be rescheduled with p->pgdir == 0.
++  pushcli();
++  switchkvm();
++  pgdir = curproc->pgdir;
++  curproc->pgdir = 0;
++  curproc->sz = 0;
++  freevm(pgdir);
++
+   acquire(&ptable.lock);
+ 
+   // Parent might be sleeping in wait().
+@@ -261,6 +794,8 @@
+     }
+   }
+ 
++  popcli();             // ptable.lock now keeps interrupts off
++
+   // Jump into the scheduler, never to return.
+   curproc->state = ZOMBIE;
+   sched();
+@@ -289,7 +824,9 @@
+         pid = p->pid;
+         kfree(p->kstack);
+         p->kstack = 0;
+-        freevm(p->pgdir);
++        if(p->pgdir)          // normally already freed by exit()
++          freevm(p->pgdir);
++        p->pgdir = 0;
+         p->pid = 0;
+         p->parent = 0;
+         p->name[0] = 0;
+@@ -409,6 +946,12 @@
+     initlog(ROOTDEV);
+   }
+ 
++  // A kernel process never returns to user space: run its entry point.
++  if(myproc()->kproc){
++    myproc()->kentry();
++    panic("kernel process returned");
++  }
++
+   // Return to "caller", actually trapret (see allocproc).
+ }
+ 
+@@ -516,6 +1059,9 @@
+   char *state;
+   uint pc[10];
+ 
++  cprintf("swap: %d pages out, %d pages in, %d pages free\n",
++          nswapout, nswapin, kfreecount());
++
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->state == UNUSED)
+       continue;
+diff -ruN a/proc.h b/proc.h
+--- a/proc.h	2020-08-10 18:28:02.000000000 +0000
++++ b/proc.h	2026-11-14 12:20:33.763938295 +0000
+@@ -49,6 +49,10 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int kproc;                   // 1 for kernel processes (never enter user space)
++  void (*kentry)(void);        // kernel process entry point
++  uint addr;                   // page-aligned VA this process waits to have swapped in
++  int swapfail;                // set by the swap-out daemon if no page could be freed
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff -ruN a/random.c b/random.c
+--- a/random.c	1970-01-01 00:00:00.000000000 +0000
++++ b/random.c	2026-11-14 12:22:45.609888559 +0000
+@@ -0,0 +1,105 @@
++// User-space pseudo-random numbers (Mersenne Twister, MT19937) for test
++// programs. Linked into every user program via ULIB.
++
++/* Period parameters */
++#define N 624
++#define M 397
++#define MATRIX_A 0x9908b0df   /* constant vector a */
++#define UPPER_MASK 0x80000000 /* most significant w-r bits */
++#define LOWER_MASK 0x7fffffff /* least significant r bits */
++
++/* Tempering parameters */
++#define TEMPERING_MASK_B 0x9d2c5680
++#define TEMPERING_MASK_C 0xefc60000
++#define TEMPERING_SHIFT_U(y)  (y >> 11)
++#define TEMPERING_SHIFT_S(y)  (y << 7)
++#define TEMPERING_SHIFT_T(y)  (y << 15)
++#define TEMPERING_SHIFT_L(y)  (y >> 18)
++
++#define RAND_MAX 0x7fffffff
++
++static unsigned long mt[N]; /* the array for the state vector  */
++static int mti=N+1; /* mti==N+1 means mt[N] is not initialized */
++
++/* initializing the array with a NONZERO seed */
++void
++sgenrand(unsigned long seed)
++{
++    /* setting initial seeds to mt[N] using         */
++    /* the generator Line 25 of Table 1 in          */
++    /* [KNUTH 1981, The Art of Computer Programming */
++    /*    Vol. 2 (2nd Ed.), pp102]                  */
++    mt[0]= seed & 0xffffffff;
++    for (mti=1; mti<N; mti++)
++        mt[mti] = (69069 * mt[mti-1]) & 0xffffffff;
++}
++
++long /* for integer generation */
++genrand()
++{
++    unsigned long y;
++    static unsigned long mag01[2]={0x0, MATRIX_A};
++    /* mag01[x] = x * MATRIX_A  for x=0,1 */
++
++    if (mti >= N) { /* generate N words at one time */
++        int kk;
++
++        if (mti == N+1)   /* if sgenrand() has not been called, */
++            sgenrand(4357); /* a default initial seed is used   */
++
++        for (kk=0;kk<N-M;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        for (;kk<N-1;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        y = (mt[N-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
++        mt[N-1] = mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1];
++
++        mti = 0;
++    }
++
++    y = mt[mti++];
++    y ^= TEMPERING_SHIFT_U(y);
++    y ^= TEMPERING_SHIFT_S(y) & TEMPERING_MASK_B;
++    y ^= TEMPERING_SHIFT_T(y) & TEMPERING_MASK_C;
++    y ^= TEMPERING_SHIFT_L(y);
++
++    // Strip off uppermost bit because we want a long,
++    // not an unsigned long
++    return y & RAND_MAX;
++}
++
++// Assumes 0 <= max <= RAND_MAX
++// Returns in the half-open interval [0, max]
++long random_at_most(long max) {
++  unsigned long
++    // max <= RAND_MAX < ULONG_MAX, so this is okay.
++    num_bins = (unsigned long) max + 1,
++    num_rand = (unsigned long) RAND_MAX + 1,
++    bin_size = num_rand / num_bins,
++    defect   = num_rand % num_bins;
++
++  long x;
++  do {
++   x = genrand();
++  }
++  // This is carefully written not to overflow
++  while (num_rand - defect <= (unsigned long)x);
++
++  // Truncated division is intentional
++  return x/bin_size;
++}
++
++// Random integer in [low, high] (inclusive).
++int randomrange(int low, int high){
++  if(high<low){
++    int temp=high;
++    high=low;
++    low=temp;
++  }
++  int val = random_at_most(high-low) + low;
++  return val;
++}
+diff -ruN a/trap.c b/trap.c
+--- a/trap.c	2020-08-10 18:28:02.000000000 +0000
++++ b/trap.c	2026-11-14 12:20:51.871579401 +0000
+@@ -78,6 +78,15 @@
+     lapiceoi();
+     break;
+ 
++  case T_PGFLT:
++    // A page we swapped out? Then sleep until the swap-in daemon has
++    // brought it back, and retry the instruction.
++    if(swap_in_request(rcr2()) == 0)
++      break;
++    // Any other page fault is a real error: kill the user process
++    // (or panic for a kernel fault), exactly as before.
++    // fall through
++
+   //PAGEBREAK: 13
+   default:
+     if(myproc() == 0 || (tf->cs&3) == 0){
+diff -ruN a/user.h b/user.h
+--- a/user.h	2020-08-10 18:28:02.000000000 +0000
++++ b/user.h	2026-11-14 12:20:33.763698106 +0000
+@@ -37,3 +37,4 @@
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++int randomrange(int, int);
+diff -ruN a/vm.c b/vm.c
+--- a/vm.c	2020-08-10 18:28:02.000000000 +0000
++++ b/vm.c	2026-11-14 13:42:06.469825925 +0000
+@@ -6,6 +6,8 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "elf.h"
++#include "spinlock.h"
++#include "sleeplock.h"
+ 
+ extern char data[];  // defined by kernel.ld
+ pde_t *kpgdir;  // for use in scheduler()
+@@ -32,7 +34,7 @@
+ // Return the address of the PTE in page table pgdir
+ // that corresponds to virtual address va.  If alloc!=0,
+ // create any required page table pages.
+-static pte_t *
++pte_t *
+ walkpgdir(pde_t *pgdir, const void *va, int alloc)
+ {
+   pde_t *pde;
+@@ -57,7 +59,7 @@
+ // Create PTEs for virtual addresses starting at va that refer to
+ // physical addresses starting at pa. va and size might not
+ // be page-aligned.
+-static int
++int
+ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
+ {
+   char *a, *last;
+@@ -216,6 +218,19 @@
+   return 0;
+ }
+ 
++// Map one page. mappages() fails only if it cannot allocate a page-table
++// page; then make room (possibly by swapping) and retry. Retrying matters
++// because the kernel is preemptible: a page freed for us may be taken by
++// another process before we get to use it.
++static int
++map1(pde_t *pgdir, uint va, char *mem, int perm)
++{
++  while(mappages(pgdir, (char*)va, PGSIZE, V2P(mem), perm) < 0)
++    if(kreserve(1) < 0)
++      return -1;
++  return 0;
++}
++
+ // Allocate page tables and physical memory to grow process from oldsz to
+ // newsz, which need not be page aligned.  Returns new size or 0 on error.
+ int
+@@ -231,14 +246,15 @@
+ 
+   a = PGROUNDUP(oldsz);
+   for(; a < newsz; a += PGSIZE){
+-    mem = kalloc();
++    // kalloc_user() may sleep until the swapper frees a page.
++    mem = kalloc_user();
+     if(mem == 0){
+       cprintf("allocuvm out of memory\n");
+       deallocuvm(pgdir, newsz, oldsz);
+       return 0;
+     }
+     memset(mem, 0, PGSIZE);
+-    if(mappages(pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0){
++    if(map1(pgdir, a, mem, PTE_W|PTE_U) < 0){
+       cprintf("allocuvm out of memory (2)\n");
+       deallocuvm(pgdir, newsz, oldsz);
+       kfree(mem);
+@@ -273,6 +289,10 @@
+       char *v = P2V(pa);
+       kfree(v);
+       *pte = 0;
++    } else if(*pte & PTE_SWAP){
++      // Swapped-out page: no frame to free. The swap file is removed by
++      // swap_free_range() (exit, exec, sbrk) before we get here.
++      *pte = 0;
+     }
+   }
+   return newsz;
+@@ -311,28 +331,42 @@
+ }
+ 
+ // Given a parent process's page table, create a copy
+-// of it for a child.
++// of it for a child. Pages the parent has swapped out are read back
++// from their swap file straight into the child's new page.
+ pde_t*
+ copyuvm(pde_t *pgdir, uint sz)
+ {
+   pde_t *d;
+   pte_t *pte;
+-  uint pa, i, flags;
++  uint i, flags;
+   char *mem;
++  struct proc *curproc = myproc();
+ 
+-  if((d = setupkvm()) == 0)
+-    return 0;
++  while((d = setupkvm()) == 0)
++    if(kreserve(KPGTABLES) < 0)
++      return 0;
+   for(i = 0; i < sz; i += PGSIZE){
++    // Allocate first: kalloc_user() may sleep, and while we sleep the
++    // swapper may evict the very parent page we are about to copy.
++    if((mem = kalloc_user()) == 0)
++      goto bad;
+     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+       panic("copyuvm: pte should exist");
+-    if(!(*pte & PTE_P))
++    if(*pte & PTE_P){
++      memmove(mem, (char*)P2V(PTE_ADDR(*pte)), PGSIZE);
++    } else if(*pte & PTE_SWAP){
++      // swapio serialises us with the daemons; re-check under it.
++      acquiresleep(&swapio);
++      if(*pte & PTE_P)
++        memmove(mem, (char*)P2V(PTE_ADDR(*pte)), PGSIZE);
++      else if(swap_read_page(curproc->pid, i, mem) < 0)
++        panic("copyuvm: swap read");
++      releasesleep(&swapio);
++    } else
+       panic("copyuvm: page not present");
+-    pa = PTE_ADDR(*pte);
+-    flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto bad;
+-    memmove(mem, (char*)P2V(pa), PGSIZE);
+-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
++    flags = PTE_FLAGS(*pte) & ~(PTE_SWAP | PTE_A | PTE_D);
++    flags |= PTE_P;
++    if(map1(d, i, mem, flags) < 0){
+       kfree(mem);
+       goto bad;
+     }

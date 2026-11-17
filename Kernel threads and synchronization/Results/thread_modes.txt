@@ -1,0 +1,32 @@
+cpu0: starting 0
+sb: size 1000 nblocks 941 ninodes 200 nlog 30 logstart 2 inodestart 32 bmap start 58
+init: starting sh
+$ thread none
+mode: none
+Starting do_work: s:b1
+Starting do_work: s:b2
+Done s:b2
+Done s:b1
+Threads finished: (4):5, (5):4, shared balance:3200 (expected 6000)
+$ thread spin
+mode: spin
+Starting do_work: s:Starting do_work: s:b2
+b1
+Done s:b2
+Done s:b1
+Threads finished: (7):8, (8):7, shared balance:6000 (expected 6000)
+$ thread mutex
+mode: mutex
+Starting do_work: s:b1
+Starting do_work: s:b2
+Done s:b1
+Done s:b2
+Threads finished: (10):10, (11):11, shared balance:6000 (expected 6000)
+$ thread sem
+mode: sem
+Starting Starting do_work: s:b2
+do_work: s:b1
+Done s:b2
+Done s:b1
+Threads finished: (13):14, (14):13, shared balance:6000 (expected 6000)
+$ 

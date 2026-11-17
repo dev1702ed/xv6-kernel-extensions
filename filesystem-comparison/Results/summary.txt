@@ -1,0 +1,18 @@
+vdbench averages from the run (ZFS on 256 MB file-backed pools, 64 MB of
+files per pool, sequential 256 KB transfers, 2 threads, capped at 100 ops/s).
+
+                     disk used  read resp  read CPU  write resp  write CPU
+compression lz4         26 MB    1.197 ms     6.5%    2.642 ms      14.9%
+compression off         65 MB    0.327 ms     3.7%    2.200 ms       7.7%
+encryption on              -     0.358 ms     3.8%    2.802 ms       9.7%
+encryption off             -     0.239 ms     2.8%    2.168 ms       6.7%
+
+- Compression cut disk usage 2.5x (matching compratio=2.5 in the config) at
+  roughly twice the CPU on both reads and writes.
+- Encryption (AES-256-GCM) added ~30% write latency and ~3 points of CPU.
+- Throughput is the same in every run (~25 MB/s) because fwdrate=100 caps it.
+- Reads were served from ZFS's RAM cache (ARC), which keeps blocks
+  compressed, so compressed reads paid for LZ4 decompression on every hit.
+
+The raw vdbench output folders (compressionTestOutput001/,
+encryptionTestOutput001/) belong in this folder.

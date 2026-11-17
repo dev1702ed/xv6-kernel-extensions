@@ -1,0 +1,15 @@
+test_scheduler under each policy (one CPU, qemu). Turnaround in timer ticks,
+measured from the start of each batch; lower is better. Emulated time is
+noisy, so compare policies, not absolute numbers.
+
+                                              RR    SJF   HYBRID
+Test 1  6 CPU-bound jobs, avg turnaround      85     36      51
+Test 2  equal work, job declaring burst 5     50     14      24
+        equal work, job declaring burst 40    50     28      37
+Test 3  mixed CPU/IO, avg (CPU-bound jobs)    61     20      32
+        mixed CPU/IO, avg (all jobs)          54     38      54
+
+Under SJF and hybrid, CPU-bound jobs finish in burst order; under RR they
+finish roughly together. SJF gives the lowest average but never preempts;
+the hybrid stays close while giving every process the CPU each round.
+Full output: test_scheduler_RR.txt, test_scheduler_SJF.txt, test_scheduler_HYBRID.txt

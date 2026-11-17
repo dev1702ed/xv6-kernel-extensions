@@ -1,0 +1,30 @@
+cpu0: starting 0
+sb: size 2000 nblocks 1941 ninodes 200 nlog 30 logstart 2 inodestart 32 bmap start 58
+init: starting sh
+$ test_scheduler
+calibration: 3878787 loop iterations per tick
+
+== Test 1: CPU-bound, bursts 30..5 forked longest first ==
+order  pid  type  burst  turnaround  switches
+1      9   CPU   5     9          2
+2      8   CPU   10     19          2
+3      7   CPU   15     34          2
+4      6   CPU   20     54          2
+5      5   CPU   25     81          2
+6      4   CPU   30     110          4
+avg turnaround (all): 51 ticks, CPU-bound only: 51 ticks, batch makespan: 113 ticks
+
+(test 2: both children do 20 units of work; declared bursts 40 and 5)
+finished 1: pid 11 declared burst 5, turnaround 24 ticks
+finished 2: pid 10 declared burst 40, turnaround 37 ticks
+
+== Test 3: mixed CPU-bound and I/O-bound ==
+order  pid  type  burst  turnaround  switches
+1      16   CPU   5     7          2
+2      14   CPU   20     31          2
+3      12   CPU   25     59          2
+4      13   IO    10     67          12
+5      15   IO    15     73          17
+6      17   IO    30     90          32
+avg turnaround (all): 54 ticks, CPU-bound only: 32 ticks, batch makespan: 94 ticks
+$ 
